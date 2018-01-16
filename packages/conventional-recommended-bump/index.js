@@ -4,86 +4,93 @@ var conventionalCommitsFilter = require('conventional-commits-filter');
 var conventionalCommitsParser = require('conventional-commits-parser');
 var gitSemverTags = require('git-semver-tags');
 var gitRawCommits = require('git-raw-commits');
-var objectAssign = require('object-assign');
+var Q = require('q');
 
 var VERSIONS = ['major', 'minor', 'patch'];
 
-function conventionalRecommendedBump(options, parserOpts, cb) {
-  var config;
-  var noop = function() {};
+module.exports = conventionalRecommendedBump;
 
+function conventionalRecommendedBump(options, parserOpts, cb) {
   if (typeof options !== 'object') {
     throw new TypeError('options must be an object');
   }
 
-  if (typeof parserOpts === 'function') {
-    cb = parserOpts;
-  } else {
-    cb = cb || noop;
-  }
+  options = Object.assign({ignoreReverted: true, warn: function() {}}, options);
 
-  options = objectAssign({
-    ignoreReverted: true,
-    warn: function() {}
-  }, options);
+  cb = typeof parserOpts === 'function' ? cb = parserOpts : cb = cb || noop;
 
+  let presetPackage;
   if (options.preset) {
     try {
-      config = require('./presets/' + options.preset);
+      presetPackage = require(`conventional-changelog-${options.preset.toLowerCase()}`);
     } catch (err) {
-      cb(new Error('Preset: "' + options.preset + '" does not exist'));
-      return;
+      return cb(new Error('Preset: "' + options.preset + '" does not exist'));
     }
   } else {
-    config = options.config || {};
+    presetPackage = options.config || {};
   }
 
-  var whatBump = options.whatBump || config.whatBump || noop;
-  parserOpts = objectAssign({}, config.parserOpts, parserOpts);
-  parserOpts.warn = parserOpts.warn || options.warn;
+  const configPromise = typeof presetPackage === `function` ? Q.nfcall(presetPackage) : new Q(presetPackage);
 
-  gitSemverTags(function(err, tags) {
-    if (err) {
-      cb(err);
-      return;
-    }
+  configPromise.then((config) => {
+    const whatBump = options.whatBump ||
+      ((config.recommendedBumpOpts && config.recommendedBumpOpts.whatBump) ? config.recommendedBumpOpts.whatBump :
+        noop);
 
-    gitRawCommits({
-      format: '%B%n-hash-%n%H',
-      from: tags[0] || '',
-      path: options.path
-    })
-      .pipe(conventionalCommitsParser(parserOpts))
-      .pipe(concat(function(data) {
-        var commits;
+    // TODO: For now we defer to `config.recommendedBumpOpts.parserOpts` if it exists, as our initial refactor
+    // efforts created a `parserOpts` object under the `recommendedBumpOpts` object in each preset package.
+    // In the future we want to merge differences found in `recommendedBumpOpts.parserOpts` into the top-level
+    // `parserOpts` object and remove `recommendedBumpOpts.parserOpts` from each preset package if it exists.
+    parserOpts = Object.assign({},
+      config.recommendedBumpOpts && config.recommendedBumpOpts.parserOpts ? config.recommendedBumpOpts.parserOpts :
+        config.parserOpts,
+      parserOpts);
 
-        if (options.ignoreReverted) {
-          commits = conventionalCommitsFilter(data);
-        } else {
-          commits = data;
-        }
+    parserOpts.warn = parserOpts.warn || options.warn;
 
-        if (!commits || !commits.length) {
-          options.warn('No commits since last release');
-        }
+    gitSemverTags(function(err, tags) {
+      if (err) {
+        cb(err);
+        return;
+      }
 
-        var result = whatBump(commits);
+      gitRawCommits({
+        format: '%B%n-hash-%n%H',
+        from: tags[0] || '',
+        path: options.path
+      })
+        .pipe(conventionalCommitsParser(parserOpts))
+        .pipe(concat(function(data) {
+          var commits;
 
-        if (typeof result === 'number') {
-          result = {
-            level: result
-          };
-        }
+          if (options.ignoreReverted) {
+            commits = conventionalCommitsFilter(data);
+          } else {
+            commits = data;
+          }
 
-        if (result && result.level != null) {
-          result.releaseType = VERSIONS[result.level];
-        } else if (result == null) {
-          result = {};
-        }
+          if (!commits || !commits.length) {
+            options.warn('No commits since last release');
+          }
 
-        cb(null, result);
-      }));
-  }, {lernaTags: !!options.lernaPackage, package: options.lernaPackage});
+          var result = whatBump(commits);
+
+          if (typeof result === 'number') {
+            result = {
+              level: result
+            };
+          }
+
+          if (result && result.level != null) {
+            result.releaseType = VERSIONS[result.level];
+          } else if (result === null || result === undefined) {
+            result = {};
+          }
+
+          cb(null, result);
+        }));
+    }, {lernaTags: !!options.lernaPackage, package: options.lernaPackage});
+  });
 }
 
-module.exports = conventionalRecommendedBump;
+function noop() {}
